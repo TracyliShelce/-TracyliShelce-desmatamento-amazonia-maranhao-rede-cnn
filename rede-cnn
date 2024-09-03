@@ -1,0 +1,163 @@
+!pip install rasterio
+
+import os
+import logging
+import numpy as np
+import geopandas as gpd
+import matplotlib.pyplot as plt
+from rasterio.features import rasterize
+from shapely.geometry import mapping
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Conv2D, MaxPooling2D, Flatten, Dense, Dropout, LSTM
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+import shutil
+from PIL import Image
+
+# Configurar o Logger
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Função para limpar diretório
+def clear_directory(directory):
+    if os.path.exists(directory):
+        for file in os.listdir(directory):
+            file_path = os.path.join(directory, file)
+            try:
+                if os.path.isfile(file_path) or os.path.islink(file_path):
+                    os.unlink(file_path)
+                elif os.path.isdir(file_path):
+                    shutil.rmtree(file_path)
+            except Exception as e:
+                logger.error(f'Failed to delete {file_path}. Reason: {e}')
+
+# Função para validar o GeoDataFrame, definindo o CRS se necessário e verificando geometrias vazias
+def validate_geodataframe(gdf, crs=None):
+    # Verificar se o GeoDataFrame está vazio
+    if gdf.empty:
+        raise ValueError("GeoDataFrame está vazio. Verifique o arquivo de origem.")
+
+    # Verificar geometrias vazias e removê-las
+    gdf = gdf[~gdf.is_empty]
+
+    # Verificar se o CRS está definido, caso contrário, definir um CRS padrão
+    if gdf.crs is None:
+        if crs is not None:
+            gdf = gdf.set_crs(crs)
+        else:
+            raise ValueError("O GeoDataFrame não possui um CRS definido e nenhum CRS padrão foi fornecido.")
+    
+    return gdf
+
+# Função para rasterizar shapefiles
+def rasterize_shapefile(gdf, out_shape, transform):
+    return rasterize(
+        [(mapping(geom), 1) for geom in gdf.geometry],
+        out_shape=out_shape,
+        transform=transform,
+        fill=0,
+        all_touched=True,
+        dtype='uint8'
+    )
+
+def generate_and_save_images(gdf, label, count, out_dir, out_shape, transform):
+    class_dir = os.path.join(out_dir, label)
+    os.makedirs(class_dir, exist_ok=True)
+    for i in range(count):
+        image = rasterize_shapefile(gdf, out_shape, transform)
+        # Gerar imagens coloridas (3 canais)
+        image_color = np.stack([image * 255] * 3, axis=-1)
+        image_path = os.path.join(class_dir, f'{label}_{i}.png')
+        Image.fromarray(image_color).save(image_path)
+
+# Definir diretórios de treinamento e validação
+base_dir = '/content/drive/MyDrive/Desmatamento_Amazonia/data'
+train_dir = os.path.join(base_dir, 'train')
+validation_dir = os.path.join(base_dir, 'validation')
+model_dir = '/content/drive/MyDrive/Desmatamento_Amazonia/models'
+results_dir = '/content/drive/MyDrive/Desmatamento_Amazonia/results'
+
+# Limpar diretórios de treinamento e validação
+clear_directory(train_dir)
+clear_directory(validation_dir)
+
+os.makedirs(train_dir, exist_ok=True)
+os.makedirs(validation_dir, exist_ok=True)
+os.makedirs(model_dir, exist_ok=True)
+os.makedirs(results_dir, exist_ok=True)
+
+# Tamanho da imagem e transformação
+out_shape = (128, 128)
+transform = [1, 0, 0, 0, 1, 0]
+
+# Carregar shapefiles e verificar geometria e CRS
+estados_amazonia = validate_geodataframe(gpd.read_file('/content/drive/MyDrive/Desmatamento_Amazonia/data/auxiliares/estados_legal_amazonia/states_legal_amazon.shp'), crs='EPSG:4326')
+municipios = validate_geodataframe(gpd.read_file('/content/drive/MyDrive/Desmatamento_Amazonia/data/auxiliares/municipios_legal_amazonia/municipalities_legal_amazon.shp'), crs='EPSG:4326')
+incremento_anual = validate_geodataframe(gpd.read_file('/content/drive/MyDrive/Desmatamento_Amazonia/data/prodes/incremento_anual_desmatamento/yearly_deforestation.shp'), crs='EPSG:4326')
+unidades_conservacao = validate_geodataframe(gpd.read_file('/content/drive/MyDrive/Desmatamento_Amazonia/data/auxiliares/unidade_conservacao_legal_amazonia/conservation_units_legal_amazon.shp'), crs='EPSG:4326')
+areas_indigenas = validate_geodataframe(gpd.read_file('/content/drive/MyDrive/Desmatamento_Amazonia/data/auxiliares/indigena_area_legal_amazonia/indigenous_area_legal_amazon.shp'), crs='EPSG:4326')
+
+# Filtrar municípios do Maranhão (geocódigo iniciando com 21)
+maranhao_code = 21
+municipios_maranhao = municipios[municipios['geocodigo'].astype(str).str.startswith(str(maranhao_code))]
+
+# Lista dos anos para processamento
+anos = [2016, 2017, 2018, 2019, 2020, 2021, 2022]
+
+# Loop para processar os shapefiles de floresta anual por ano
+for ano in anos:
+    file_path = f'/content/drive/MyDrive/Desmatamento_Amazonia/data/prodes/floresta_anual/forest_FOREST_{ano}.shp'
+    # Ler e validar o shapefile
+    floresta_anual = validate_geodataframe(gpd.read_file(file_path), crs='EPSG:4674')
+
+    # Reprojetar para EPSG:4326
+    floresta_anual = floresta_anual.to_crs(epsg=4326)
+
+    # Interseção com os municípios do Maranhão (certifique-se de que municipios_maranhao esteja definido corretamente)
+    floresta_maranhao = gpd.overlay(floresta_anual, municipios_maranhao, how='intersection')
+
+    # Continue com o processamento necessário...
+
+    # Gerar e salvar imagens para o treinamento
+    generate_and_save_images(floresta_maranhao, f'floresta_{ano}', 1000, train_dir, out_shape, transform)
+    generate_and_save_images(floresta_maranhao, f'floresta_{ano}', 200, validation_dir, out_shape, transform)
+
+# Normalizar os dados
+datagen = ImageDataGenerator(
+    rescale=1./255,
+    rotation_range=40,
+    width_shift_range=0.2,
+    height_shift_range=0.2,
+    shear_range=0.2,
+    zoom_range=0.2,
+    horizontal_flip=True,
+    fill_mode='nearest'
+)
+
+# Camadas de previsão temporal (usando LSTM para capturar mudanças no tempo)
+model = Sequential([
+    Conv2D(32, (3, 3), activation='relu', input_shape=(128, 128, 3)),
+    MaxPooling2D((2, 2)),
+    Conv2D(64, (3, 3), activation='relu'),
+    MaxPooling2D((2, 2)),
+    Flatten(),
+    LSTM(64, return_sequences=True),  # LSTM para prever sequências temporais
+    Dense(256, activation='relu'),
+    Dropout(0.5),
+    Dense(1, activation='sigmoid')
+])
+
+# Compilação do modelo
+model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+
+# Treinamento e validação cruzada
+history = model.fit(
+    datagen.flow_from_directory(train_dir, target_size=(128, 128), batch_size=32, class_mode='binary', color_mode='rgb'),
+    validation_data=datagen.flow_from_directory(validation_dir, target_size=(128, 128), batch_size=32, class_mode='binary', color_mode='rgb'),
+    epochs=20
+)
+
+# Salvar modelo e resultados
+model.save(os.path.join(model_dir, 'model.h5'))
+
+# Logging dos resultados
+logger.info(f"Modelo salvo em {model_dir}")
